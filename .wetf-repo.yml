@@ -1,0 +1,11 @@
+---
+# Repository configuration for wetransform managed repositories
+
+# Reference presets that should apply to this repository
+presets:
+  - github-actions
+  - renovate-config
+  - workflows-default
+
+required_checks:
+  - check

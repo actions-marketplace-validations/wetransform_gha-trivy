@@ -1,5 +1,5 @@
-name: 'Vulnerability scan'
-description: 'Perform vulnerability scan and report using trivy'
+name: "Vulnerability scan"
+description: "Perform vulnerability scan and report using trivy"
 branding:
   icon: search
   color: blue
@@ -7,101 +7,297 @@ inputs:
   image-ref:
     description: Image to scan (if not specified an fs scan is done)
     required: false
-    default: ''
+    default: ""
+  scan-ref:
+    description: Existing SBOM to use, if set image-ref is ignored
+    required: false
+    default: ""
+  upload-scan-ref:
+    description: If the existing SBOM used for scanning should be uploaded as an artifact
+    required: false
+    default: "false" # Note: Action inputs are always of type string
   junit-test-output:
     description: Location to write JUnit test report to
     required: false
-    default: ''
+    default: ""
   create-test-report:
     description: If a JUnit test report should be created by the action (otherwise it is assumed to report is handled outside of the action)
     required: false
-    default: 'false' # Note: Action inputs are always of type string
+    default: "false" # Note: Action inputs are always of type string
   fail-for:
     description: Issue types for fail for if they are present (added to JUnit report)
-    default: CRITICAL
+    default: "" # e.g. CRITICAL,HIGH
   report-retention-days:
     description: Number of days to retain the HTML report
     default: 30
   report-tag:
     description: Custom tag for report file, discern multiple reports created in the same run. By the default the job ID is used
-    default: ''
+    default: ""
+  check-image-user:
+    description: If the user of the Docker image should be checked to be non-root
+    default: "true" # Note: Action inputs are always of type string
+  create-summary:
+    description: If a summary should be created
+    default: "true"
 runs:
   using: "composite"
   steps:
+    # Detect Trivy config and ignore files if present
+    # Note: During testing, support for .trivyignore files in YAML format did not work - it seems as this is still an experimental feature of trivy
+    #       it should be avoided to use YAML format for .trivyignore files for now
+    - name: Detect Trivy config files
+      id: detect-trivy-config
+      shell: bash
+      run: |
+        # Detect trivy.yaml
+        if [ -f "trivy.yaml" ]; then
+          echo "TRIVY_CONFIG_PATH=trivy.yaml" >> $GITHUB_ENV
+        fi
+        # Detect .trivyignore* (prefer yaml/yml, fallback to .trivyignore)
+        if [ -f ".trivyignore.yaml" ]; then
+          echo "TRIVY_IGNORES_PATH=.trivyignore.yaml" >> $GITHUB_ENV
+        elif [ -f ".trivyignore.yml" ]; then
+          echo "TRIVY_IGNORES_PATH=.trivyignore.yml" >> $GITHUB_ENV
+        elif [ -f ".trivyignore" ]; then
+          echo "TRIVY_IGNORES_PATH=.trivyignore" >> $GITHUB_ENV
+        fi
+
+    # Determine effective fail-for value (may come from file if not explicitly set)
+    # For convenience, only the lowest severity needs to be specified in the file
+    - name: Determine fail-for severity
+      id: determine-fail-for
+      shell: bash
+      run: |
+        # If fail-for is set, use it directly
+        if [ "${{ inputs.fail-for }}" != "" ]; then
+          echo "FAIL_FOR_EFFECTIVE=${{ inputs.fail-for }}" >> $GITHUB_ENV
+        else
+          # If .trivy-fail-for exists, map its content
+          if [ -f ".trivy-fail-for" ]; then
+            SEVERITY=$(cat .trivy-fail-for | tr -d '\n' | xargs)
+            SEVERITY_UPPER=$(echo "$SEVERITY" | tr '[:lower:]' '[:upper:]')
+            case "$SEVERITY_UPPER" in
+              CRITICAL)
+                FAIL_FOR="CRITICAL" ;;
+              HIGH)
+                FAIL_FOR="CRITICAL,HIGH" ;;
+              MEDIUM)
+                FAIL_FOR="CRITICAL,HIGH,MEDIUM" ;;
+              LOW)
+                FAIL_FOR="CRITICAL,HIGH,MEDIUM,LOW" ;;
+              *)
+                echo "::error::Unrecognized severity value in .trivy-fail-for: '$SEVERITY'" >&2
+                exit 1
+                ;;
+            esac
+            echo "FAIL_FOR_EFFECTIVE=$FAIL_FOR" >> $GITHUB_ENV
+          else
+            # Default to CRITICAL (original behavior)
+            echo "FAIL_FOR_EFFECTIVE=CRITICAL" >> $GITHUB_ENV
+          fi
+        fi
+
+    - name: Determine valid report slug and file name
+      shell: bash
+      run: |
+        # Use report tag or job ID
+        INPUT_STRING="${{ inputs.report-tag != '' && inputs.report-tag || github.job }}"
+
+        # Replace invalid characters with underscores
+        VALID_SLUG=$(echo "$INPUT_STRING" | sed 's/[^A-Za-z0-9_.-]/_/g')
+
+        # Set the processed value as an environment variable
+        echo "REPORT_SLUG=$VALID_SLUG" >> $GITHUB_ENV
+        echo "REPORT_FILENAME=${VALID_SLUG}-trivy.html" >> $GITHUB_ENV
+
+    - name: Install CycloneDX CLI # https://github.com/CycloneDX/cyclonedx-cli
+      uses: jaxxstorm/action-install-gh-release@cd6b2b78ad38bdd294341cda064ec0692b06215b # v1.14.0
+      with:
+        repo: CycloneDX/cyclonedx-cli
+        tag: v0.29.1 # optional, otherwise use latest
+
+        # extension-matching: disable # disable extension matching because artifacts are binaries
+
+        # work around action picking wrong artifact (with `musl`) - open issue on specifying artifact manually see https://github.com/jaxxstorm/action-install-gh-release/issues/84
+        extension: -linux-x64
+        platform: cyclone
+        arch: dx
+
+        rename-to: cyclonedx-cli
+        chmod: 0755
+        cache: enable # only works if using specific tag
+    - name: Verify CycloneDX CLI install
+      shell: bash
+      run: cyclonedx-cli --version
+
+    #
+    # Check Docker image user
+    #
+
+    - name: Check Docker image user
+      uses: wetransform/gha-docker-nonroot@0809574ec961694bfc203d12ec9c4c94bd2d46e8 # v1.0.3
+      if: "${{ inputs.check-image-user == 'true' && inputs.image-ref != '' && (inputs.junit-test-output != '' || inputs.create-test-report) }}"
+      with:
+        image-ref: ${{ inputs.image-ref }}
+        fail-for-root: false # rather use JUnit report
+        # XXX disable check until we clarified how to deal with root users in images
+        create-junit-output: false
+        junit-test-output: "${{ inputs.junit-test-output != '' && inputs.junit-test-output || 'trivy.xml' }}-user-check.xml"
+
     #
     # Scan for security vulnerabilities
     #
 
-      # https://github.com/aquasecurity/trivy-action
-    - name: Scan Docker image for critical vulnerabilities
-      uses: aquasecurity/trivy-action@0.12.0
-      if: "${{ inputs.junit-test-output != '' || inputs.create-test-report }}"
+    - name: Install Trivy
+      uses: aquasecurity/setup-trivy@e6c2c5e321ed9123bda567646e2f96565e34abe1 # v0.2.4
       with:
-        image-ref: '${{ inputs.image-ref }}'
-        scan-type: "${{ inputs.image-ref != '' && 'image' || 'fs' }}"
-        format: 'template'
-        template: '@/contrib/junit.tpl'
-        output: "${{ inputs.junit-test-output != '' && inputs.junit-test-output || 'trivy.xml' }}"
-        ignore-unfixed: true
-        vuln-type: 'os,library'
-        severity: ${{ inputs.fail-for }}
+        # renovate: datasource=github-tags depName=aquasecurity/trivy
+        version: v0.67.2
+        cache: true
 
-    - name: Determine report file name
+    - name: Restore trivy cache
+      id: cache-trivy-restore
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: .trivy
+        key: ${{ runner.os }}-trivy-${{ github.job }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-trivy-
+
+      # https://github.com/aquasecurity/trivy-action
+      # Approach based on https://github.com/aquasecurity/trivy-action/issues/173#issuecomment-1497774518
+    - name: Create SBOM
+      if: "${{ inputs.scan-ref == '' }}"
+      uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # 0.33.1
+      with:
+        image-ref: "${{ inputs.image-ref }}"
+        scan-type: "${{ inputs.image-ref != '' && 'image' || 'fs' }}"
+        format: "cyclonedx" # spdx-json
+        output: "${{ env.REPORT_SLUG }}-sbom.json"
+        cache-dir: .trivy
+        cache: "false" # use our own cache handling
+        trivy-config: ${{ env.TRIVY_CONFIG_PATH }}
+        trivyignores: ${{ env.TRIVY_IGNORES_PATH }}
+        skip-setup-trivy: true
+    - name: Use existing SBOM
+      if: "${{ inputs.scan-ref != '' }}"
       shell: bash
       run: |
-          # Use report tag or job ID
-          INPUT_STRING="${{ inputs.report-tag != '' && inputs.report-tag || github.job }}-trivy.html"
+        cp ${{ inputs.scan-ref }} ${{ env.REPORT_SLUG }}-sbom.json
+    - name: Create CSV representation
+      if: "${{ inputs.scan-ref == '' || inputs.upload-scan-ref == 'true' }}"
+      shell: bash
+      run: |
+        cyclonedx-cli convert --input-file ${{ env.REPORT_SLUG }}-sbom.json --output-file ${{ env.REPORT_SLUG }}-sbom.csv --output-format csv
+    - name: Upload SBOM
+      if: "${{ inputs.scan-ref == '' || inputs.upload-scan-ref == 'true' }}"
+      uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+      with:
+        name: SBOM (CycloneDX) [${{ env.REPORT_SLUG }}]
+        path: |
+          ${{ env.REPORT_SLUG }}-sbom.json
+          ${{ env.REPORT_SLUG }}-sbom.csv
+        retention-days: ${{ inputs.report-retention-days }}
 
-          # Replace invalid characters with underscores
-          VALID_FILENAME=$(echo "$INPUT_STRING" | sed 's/[^A-Za-z0-9_.-]/_/g')
-
-          # Set the processed value as an environment variable
-          echo "REPORT_FILENAME=$VALID_FILENAME" >> $GITHUB_ENV
+      # https://github.com/aquasecurity/trivy-action
+    - name: Scan for critical vulnerabilities (create JUnit report)
+      uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # 0.33.1
+      if: "${{ inputs.junit-test-output != '' || inputs.create-test-report }}"
+      with:
+        scan-ref: "${{ env.REPORT_SLUG }}-sbom.json"
+        scan-type: sbom
+        format: "template"
+        template: "@$HOME/.local/bin/trivy-bin/contrib/junit.tpl"
+        output: "${{ inputs.junit-test-output != '' && inputs.junit-test-output || 'trivy.xml' }}"
+        ignore-unfixed: true
+        vuln-type: "os,library"
+        severity: ${{ env.FAIL_FOR_EFFECTIVE }}
+        cache-dir: .trivy
+        cache: "false" # use our own cache handling
+        trivy-config: ${{ env.TRIVY_CONFIG_PATH }}
+        trivyignores: ${{ env.TRIVY_IGNORES_PATH }}
+        skip-setup-trivy: true
 
     - name: Create vulnerability report as HTML
-      uses: aquasecurity/trivy-action@0.12.0
+      uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # 0.33.1
+      env:
+        # workaround for trivy action not setting env variables if they use the default value
+        # we need to set the environment manually to the defaults to override previous settings
+        TRIVY_SEVERITY: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+        TRIVY_IGNORE_UNFIXED: "false"
       with:
-        image-ref: '${{ inputs.image-ref }}'
-        scan-type: "${{ inputs.image-ref != '' && 'image' || 'fs' }}"
-        format: 'template'
-        template: '@/contrib/html.tpl'
+        scan-ref: "${{ env.REPORT_SLUG }}-sbom.json"
+        scan-type: sbom
+        format: "template"
+        template: "@$HOME/.local/bin/trivy-bin/contrib/html.tpl"
         output: ${{ env.REPORT_FILENAME }}
+        cache-dir: .trivy
+        cache: "false" # use our own cache handling
+        trivy-config: ${{ env.TRIVY_CONFIG_PATH }}
+        trivyignores: ${{ env.TRIVY_IGNORES_PATH }}
+        skip-setup-trivy: true
     - name: Upload vulnerability report
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
       if: always()
       with:
-        name: Vulnerability report (HTML)
+        name: Vulnerability report (HTML) [${{ env.REPORT_SLUG }}]
         path: ${{ env.REPORT_FILENAME }}
         retention-days: ${{ inputs.report-retention-days }}
 
     - name: Copy vulnerability summary template
+      if: ${{ inputs.create-summary == 'true' }}
       shell: bash
       run: |
         cp ${GITHUB_ACTION_PATH}/summary.tpl ./trivy-summary.tpl
     - name: Create summary on vulnerabilities
-      uses: aquasecurity/trivy-action@0.12.0
+      if: ${{ inputs.create-summary == 'true' }}
+      uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8 # 0.33.1
+      env:
+        # workaround for trivy action not setting env variables if they use the default value
+        # we need to set the environment manually to the defaults to override previous settings
+        TRIVY_SEVERITY: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+        TRIVY_IGNORE_UNFIXED: "false"
       with:
-        image-ref: '${{ inputs.image-ref }}'
-        scan-type: "${{ inputs.image-ref != '' && 'image' || 'fs' }}"
-        format: 'template'
-        template: '@trivy-summary.tpl'
-        output: 'trivy.md'
+        scan-ref: "${{ env.REPORT_SLUG }}-sbom.json"
+        scan-type: sbom
+        format: "template"
+        template: "@trivy-summary.tpl"
+        output: "trivy.md"
+        cache-dir: .trivy
+        cache: "false" # use our own cache handling
+        trivy-config: ${{ env.TRIVY_CONFIG_PATH }}
+        trivyignores: ${{ env.TRIVY_IGNORES_PATH }}
+        skip-setup-trivy: true
     - name: Add to job summary
+      if: ${{ inputs.create-summary == 'true' }}
       shell: bash
       run: |
         echo "### Vulnerability summary (${{ inputs.image-ref != '' && inputs.image-ref || 'fs' }})" >> $GITHUB_STEP_SUMMARY
         cat trivy.md >> $GITHUB_STEP_SUMMARY
 
+      # Save trivy cache
+    - name: Fix .trivy permissions
+      shell: bash
+      run: sudo chown -R $(stat . -c %u:%g) .trivy
+    - name: Save trivy cache
+      continue-on-error: true # ignore error (e.g. if cached was already saved in same workflow run)
+      if: always() # always save
+      id: cache-trivy-save
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: .trivy
+        key: ${{ steps.cache-trivy-restore.outputs.cache-primary-key }}
+
     #
     # Report on unit tests and critical vulnerabilities
     #
 
-      # https://github.com/marketplace/actions/junit-report-action
+    # https://github.com/marketplace/actions/junit-report-action
     - name: Publish Test Report
-      uses: mikepenz/action-junit-report@v3
+      uses: mikepenz/action-junit-report@e08919a3b1fb83a78393dfb775a9c37f17d8eea6 # v6.0.1
       if: ${{ always() && inputs.create-test-report == 'true' }} # always run even if the previous step fails
       with:
-        report_paths: "${{ inputs.junit-test-output != '' && inputs.junit-test-output || 'trivy.xml' }}"
+        report_paths: "${{ inputs.junit-test-output != '' && inputs.junit-test-output || 'trivy.xml' }}*"
 
         fail_on_failure: true
 
